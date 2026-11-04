@@ -42,6 +42,7 @@ import java.util.concurrent.Executors;
 public class ManagerActivity extends Activity {
 
     private static final int IMPORT_REQUEST = 100;
+    private static final int PLUGIN_REQUEST = 101;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -149,7 +150,7 @@ public class ManagerActivity extends Activity {
         content.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("ST-Manager");
+        title.setText("ST-Manager Mod");
         title.setTextColor(Ui.TEXT);
         title.setTextSize(24);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
@@ -190,6 +191,13 @@ public class ManagerActivity extends Activity {
         topActions.addView(repairTop, weightParams());
         topActions.addView(packagesTop, weightParams());
         topActions.addView(updateTop, weightParams());
+
+        Button pluginButton = makeButton("Install cl-helper (ZIP)", Ui.ACCENT);
+        pluginButton.setOnClickListener(v -> confirmPluginInstall());
+        LinearLayout.LayoutParams pluginParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pluginParams.topMargin = Ui.dp(this, 8);
+        content.addView(pluginButton, pluginParams);
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(cardsContainer, new ScrollView.LayoutParams(
@@ -402,6 +410,50 @@ public class ManagerActivity extends Activity {
                 .show();
     }
 
+    // ---------- server plugin installation ----------
+
+    private void confirmPluginInstall() {
+        boolean running = false;
+        for (InstanceManager.Instance inst : InstanceManager.list(this)) {
+            if (ServerService.isRunning(inst.id)) {
+                running = true;
+                break;
+            }
+        }
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Install cl-helper?")
+                .setMessage("Select the ZIP downloaded from the official Character Library repository. "
+                        + "Only extras/cl-helper will be extracted. Server plugins will be enabled "
+                        + "in each instance's config.yaml. Install only plugins you trust."
+                        + (running ? "\n\nStop all SillyTavern instances first." : ""))
+                .setPositiveButton("Choose ZIP", (d, w) -> {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                            .addCategory(Intent.CATEGORY_OPENABLE)
+                            .setType("application/zip");
+                    try {
+                        startActivityForResult(intent, PLUGIN_REQUEST);
+                    } catch (Exception e) {
+                        toast("Cannot open file picker: " + e.getMessage());
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void installPlugin(Uri uri) {
+        executor.execute(() -> {
+            try {
+                setBusy("Installing cl-helper...");
+                String result = ClHelperInstaller.install(this, uri);
+                toast(result);
+            } catch (Exception e) {
+                toast("Plugin installation failed: " + e.getMessage());
+            } finally {
+                clearBusy();
+            }
+        });
+    }
+
     // ---------- backup import ----------
 
     private void confirmImport(InstanceManager.Instance inst) {
@@ -432,178 +484,4 @@ public class ManagerActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != IMPORT_REQUEST || resultCode != RESULT_OK || data == null
-                || data.getData() == null || importTargetInstance < 1) {
-            return;
-        }
-        final int targetId = importTargetInstance;
-        importTargetInstance = -1;
-        final Uri uri = data.getData();
-        executor.execute(() -> {
-            try {
-                runImport(targetId, uri);
-                toast("Backup imported into ST-Inst" + targetId);
-            } catch (Exception e) {
-                toast("Import failed: " + e.getMessage());
-            } finally {
-                clearBusy();
-            }
-        });
-    }
-
-    /**
-     * Imports a SillyTavern backup zip. Detects whether the zip holds a
-     * whole data root (contains default-user/) or a single user directory
-     * (the format of SillyTavern's own backup download, with characters/,
-     * chats/, settings.json at the zip root) and merges it into the right
-     * place. A single wrapping top-level folder is stripped.
-     */
-    private void runImport(int instanceId, Uri uri) throws Exception {
-        long deadline = System.currentTimeMillis() + 15_000;
-        while (ServerService.isRunning(instanceId) && System.currentTimeMillis() < deadline) {
-            Thread.sleep(300);
-        }
-        setBusy("Reading backup...");
-        File stagingZip = new File(getCacheDir(), "import.zip");
-        try (InputStream in = getContentResolver().openInputStream(uri);
-             OutputStream out = new FileOutputStream(stagingZip)) {
-            byte[] buf = new byte[256 * 1024];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
-            }
-        }
-
-        File staging = new File(getCacheDir(), "import-staging");
-        InstanceManager.deleteRecursively(staging);
-        setBusy("Extracting backup...");
-        PayloadExtractor.extractZipFile(stagingZip, staging, (done, total, current) ->
-                setBusy("Extracting backup... " + done + "/" + total));
-        stagingZip.delete();
-
-        File root = staging;
-        for (int i = 0; i < 3; i++) {
-            File[] children = root.listFiles();
-            if (children != null && children.length == 1 && children[0].isDirectory()
-                    && !looksLikeDataRoot(children[0]) && !looksLikeUserDir(children[0])) {
-                root = children[0];
-            } else {
-                break;
-            }
-        }
-
-        File target;
-        if (looksLikeDataRoot(root)) {
-            target = InstanceManager.dataRoot(this, instanceId);
-        } else {
-            target = new File(InstanceManager.dataRoot(this, instanceId), "default-user");
-        }
-        setBusy("Installing data...");
-        InstanceManager.copyRecursively(root, target);
-        InstanceManager.deleteRecursively(staging);
-    }
-
-    private static boolean looksLikeDataRoot(File dir) {
-        return new File(dir, "default-user").isDirectory()
-                || new File(dir, "_storage").isDirectory();
-    }
-
-    private static boolean looksLikeUserDir(File dir) {
-        return new File(dir, "settings.json").isFile()
-                || new File(dir, "characters").isDirectory()
-                || new File(dir, "chats").isDirectory();
-    }
-
-    // ---------- updates ----------
-
-    private void showUpdateDialog() {
-        String[] options = {"Latest (stable release)", "Staging (development branch)"};
-        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle("Update SillyTavern")
-                .setItems(options, (d, which) ->
-                        confirmUpdate(which == 0 ? StUpdater.Mode.ST_LATEST : StUpdater.Mode.ST_STAGING))
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    private void confirmUpdate(StUpdater.Mode mode) {
-        String title;
-        String message;
-        switch (mode) {
-            case ST_LATEST:
-                title = "Update to the latest stable release?";
-                message = "Downloads and installs the newest SillyTavern release from GitHub.";
-                break;
-            case ST_STAGING:
-                title = "Switch to the staging branch?";
-                message = "Installs the current development state of SillyTavern. May be unstable.";
-                break;
-            case PACKAGES:
-                title = "Update packages?";
-                message = "Runs npm install to sync all dependencies with the current SillyTavern version.";
-                break;
-            default:
-                title = "Repair payload?";
-                message = "Restores the bundled SillyTavern " + InstanceManager.payloadStVersion(this)
-                        + " from the app package, discarding any on-device updates. Instance data is kept.";
-                break;
-        }
-        if (mode != StUpdater.Mode.REPAIR) {
-            message += "\n\nAll running instances will be stopped. Requires internet.";
-        } else {
-            message += "\n\nAll running instances will be stopped.";
-        }
-        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle(title)
-                .setMessage(message)
-                .setPositiveButton("Start", (d, w) ->
-                        startActivity(new Intent(this, UpdateActivity.class)
-                                .putExtra(UpdateActivity.EXTRA_MODE, mode.name())))
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    private void checkForUpdatesOnce() {
-        if (updateChecked) {
-            return;
-        }
-        updateChecked = true;
-        executor.execute(() -> {
-            String latest = StUpdater.fetchLatestReleaseTag();
-            if (latest == null) {
-                return;
-            }
-            String current = InstanceManager.payloadStVersion(this);
-            if (!latest.equals(current) && !current.startsWith("staging@")) {
-                handler.post(() -> {
-                    updateBadge.setText("SillyTavern " + latest + " is available — use Update ST on any instance");
-                    updateBadge.setVisibility(View.VISIBLE);
-                });
-            }
-        });
-    }
-
-    // ---------- helpers ----------
-
-    private void setBusy(String text) {
-        handler.post(() -> {
-            busyText.setText(text);
-            busyOverlay.setVisibility(View.VISIBLE);
-        });
-    }
-
-    private void clearBusy() {
-        handler.post(() -> busyOverlay.setVisibility(View.GONE));
-    }
-
-    private void toast(String text) {
-        handler.post(() -> Toast.makeText(this, text, Toast.LENGTH_LONG).show());
-    }
-
-    private void requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
-        }
-    }
-}
+        if (r
